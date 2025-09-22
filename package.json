@@ -1,29 +1,29 @@
 {
-  "name": "okx-dex-alert",
+  "name": "bsc-ema-monitor",
   "version": "1.0.0",
-  "description": "BSC代币EMA多头排列监控工具 - 自动检测EMA信号并发送Telegram通知",
+  "description": "BSC EMA Bullish Signal Monitor",
   "main": "bsc_active_tokens_analyzer.js",
   "scripts": {
     "start": "node bsc_active_tokens_analyzer.js",
-    "dev": "node bsc_active_tokens_analyzer.js"
+    "dev": "node bsc_active_tokens_analyzer.js",
+    "build": "echo 'No build step required'",
+    "test": "echo 'No tests specified'"
   },
   "dependencies": {
-    "axios": "^1.6.0"
+    "axios": "^1.6.0",
+    "dotenv": "^16.3.1"
+  },
+  "engines": {
+    "node": ">=16.0.0"
   },
   "keywords": [
     "bsc",
-    "binance-smart-chain",
     "ema",
-    "trading",
     "cryptocurrency",
-    "telegram",
-    "alert",
-    "okx",
-    "dex"
+    "trading",
+    "monitor",
+    "telegram"
   ],
-  "author": "RichardTsang202",
-  "license": "MIT",
-  "engines": {
-    "node": ">=16.0.0"
-  }
+  "author": "BSC Monitor",
+  "license": "MIT"
 }
