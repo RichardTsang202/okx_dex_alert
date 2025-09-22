@@ -323,24 +323,25 @@ class BSCActiveTokensAnalyzer {
 
     /**
      * 获取代币详细信息（带重试机制）
+     * 使用OKX DEX API的代币交易信息接口
      */
     async getTokenInfo(tokenAddress, maxRetries = 3) {
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
             try {
                 console.log(`获取代币信息 ${tokenAddress} (尝试 ${attempt}/${maxRetries})...`);
                 
-                const endpoint = '/api/v5/dex/market/token';
+                const endpoint = '/api/v5/dex/market/price-info';
                 
-                const params = new URLSearchParams({
+                // 构建请求体，使用POST方法
+                const requestBody = JSON.stringify([{
                     chainIndex: this.bscChainIndex,
                     tokenContractAddress: tokenAddress.toLowerCase()
-                });
+                }]);
 
-                const requestPath = `${endpoint}?${params.toString()}`;
-                const headers = this.getHeaders('GET', requestPath);
-                const fullUrl = this.baseUrl + requestPath;
+                const headers = this.getHeaders('POST', endpoint, requestBody);
+                const fullUrl = this.baseUrl + endpoint;
 
-                const response = await axios.get(fullUrl, { headers, timeout: 15000 });
+                const response = await axios.post(fullUrl, requestBody, { headers, timeout: 15000 });
                 await this.sleep(300); // 增加延迟时间
 
                 console.log(`API响应状态: ${response.status}, 代码: ${response.data?.code}`);
@@ -351,12 +352,12 @@ class BSCActiveTokensAnalyzer {
                         console.log(`代币数据:`, JSON.stringify(tokenData, null, 2));
                         
                         const result = {
-                            name: tokenData.tokenName || tokenData.name || 'Unknown',
-                            symbol: tokenData.tokenSymbol || tokenData.symbol || 'Unknown',
-                            marketCap: tokenData.marketCap || tokenData.marketCapUsd || '0',
-                            volume24h: tokenData.volume24h || tokenData.volume24hUsd || '0',
-                            holderCount: tokenData.holderCount || tokenData.holders || '0',
-                            price: tokenData.price || tokenData.priceUsd || '0'
+                            name: `Token_${tokenAddress.slice(0, 8)}`, // API不返回代币名称，使用地址前缀
+                            symbol: `TOKEN_${tokenAddress.slice(-4).toUpperCase()}`, // API不返回代币符号，使用地址后缀
+                            marketCap: tokenData.marketCap || '0',
+                            volume24h: tokenData.volume24H || '0',
+                            holderCount: tokenData.holders || '0',
+                            price: tokenData.price || '0'
                         };
                         
                         console.log(`解析后的代币信息:`, result);
@@ -447,17 +448,31 @@ class BSCActiveTokensAnalyzer {
         const prevEMA55 = ema55[prevIndex];
         const prevEMA144 = ema144[prevIndex];
         
-        // 打印EMA值
-        console.log(`${token.symbol} EMA值 - EMA21: ${latestEMA21.toFixed(8)}, EMA55: ${latestEMA55.toFixed(8)}, EMA144: ${latestEMA144.toFixed(8)}`);
+        // 打印当前K线EMA值
+        console.log(`${token.symbol} 当前K线EMA值 - EMA21: ${latestEMA21.toFixed(8)}, EMA55: ${latestEMA55.toFixed(8)}, EMA144: ${latestEMA144.toFixed(8)}`);
+        
+        // 打印前一根K线EMA值
+        console.log(`${token.symbol} 前一根K线EMA值 - EMA21: ${prevEMA21.toFixed(8)}, EMA55: ${prevEMA55.toFixed(8)}, EMA144: ${prevEMA144.toFixed(8)}`);
         
         // 检查最新K线是否满足多头排列：EMA21 > EMA55 > EMA144
         const currentBullish = latestEMA21 > latestEMA55 && latestEMA55 > latestEMA144;
         
         // 检查前一根K线是否不满足多头排列
-        const prevNotBullish = !(prevEMA21 > prevEMA55 && prevEMA55 > prevEMA144);
+        const prevBullish = prevEMA21 > prevEMA55 && prevEMA55 > prevEMA144;
+        const prevNotBullish = !prevBullish;
         
-        console.log(`${token.symbol} - 当前多头排列: ${currentBullish}, 前一根非多头排列: ${prevNotBullish}`);
-        console.log(`${token.symbol} - EMA判断结果: EMA21(${latestEMA21.toFixed(8)}) > EMA55(${latestEMA55.toFixed(8)}) = ${latestEMA21 > latestEMA55}, EMA55(${latestEMA55.toFixed(8)}) > EMA144(${latestEMA144.toFixed(8)}) = ${latestEMA55 > latestEMA144}`);
+        console.log(`${token.symbol} - 当前K线多头排列: ${currentBullish}`);
+        console.log(`${token.symbol} - 前一根K线多头排列: ${prevBullish}`);
+        console.log(`${token.symbol} - 前一根K线非多头排列: ${prevNotBullish}`);
+        
+        // 详细的EMA比较结果
+        console.log(`${token.symbol} - 当前K线EMA比较:`);
+        console.log(`  EMA21(${latestEMA21.toFixed(8)}) > EMA55(${latestEMA55.toFixed(8)}) = ${latestEMA21 > latestEMA55}`);
+        console.log(`  EMA55(${latestEMA55.toFixed(8)}) > EMA144(${latestEMA144.toFixed(8)}) = ${latestEMA55 > latestEMA144}`);
+        
+        console.log(`${token.symbol} - 前一根K线EMA比较:`);
+        console.log(`  EMA21(${prevEMA21.toFixed(8)}) > EMA55(${prevEMA55.toFixed(8)}) = ${prevEMA21 > prevEMA55}`);
+        console.log(`  EMA55(${prevEMA55.toFixed(8)}) > EMA144(${prevEMA144.toFixed(8)}) = ${prevEMA55 > prevEMA144}`);
         
         // 如果当前满足多头排列且前一根不满足，则触发信号
         if (currentBullish && prevNotBullish) {
