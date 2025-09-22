@@ -63,10 +63,27 @@ class BSCActiveTokensAnalyzer {
             const chatId = process.env.TELEGRAM_CHAT_ID;
             
             if (!telegramToken || !chatId) {
-                console.log('Telegram配置未设置，跳过消息发送');
+                console.log('❌ Telegram配置未设置，跳过消息发送');
+                console.log('请检查环境变量: TELEGRAM_BOT_TOKEN 和 TELEGRAM_CHAT_ID');
                 return false;
             }
+            
+            // 验证Token格式 (应该类似: 123456789:ABCdefGHIjklMNOpqrsTUVwxyz)
+            if (!telegramToken.includes(':') || telegramToken.length < 35) {
+                console.error('❌ Telegram Bot Token格式不正确');
+                console.log('正确格式应该是: 数字:字母数字组合，例如: 123456789:ABCdefGHIjklMNOpqrsTUVwxyz');
+                return false;
+            }
+            
+            // 验证Chat ID格式 (应该是数字或以-开头的数字)
+            if (!/^-?\d+$/.test(chatId)) {
+                console.error('❌ Telegram Chat ID格式不正确');
+                console.log('Chat ID应该是纯数字或负数，例如: 123456789 或 -123456789');
+                return false;
+            }
+            
             const url = `https://api.telegram.org/bot${telegramToken}/sendMessage`;
+            console.log(`📤 正在发送Telegram消息到Chat ID: ${chatId}`);
             
             const response = await axios.post(url, {
                 chat_id: chatId,
@@ -75,14 +92,44 @@ class BSCActiveTokensAnalyzer {
             }, { timeout: 10000 });
             
             if (response.data.ok) {
-                console.log('Telegram消息发送成功');
+                console.log('✅ Telegram消息发送成功');
                 return true;
             } else {
-                console.error('Telegram消息发送失败:', response.data);
+                console.error('❌ Telegram消息发送失败:', response.data);
                 return false;
             }
         } catch (error) {
-            console.error('发送Telegram消息时出错:', error.message);
+            console.error('❌ 发送Telegram消息时出错:', error.message);
+            
+            // 详细的错误诊断
+            if (error.response) {
+                console.error('HTTP状态码:', error.response.status);
+                console.error('错误详情:', error.response.data);
+                
+                if (error.response.status === 404) {
+                    console.error('🔍 404错误诊断:');
+                    console.error('1. 检查Bot Token是否正确 (格式: 数字:字母数字)');
+                    console.error('2. 确认Bot是否已通过@BotFather创建');
+                    console.error('3. 验证Bot Token是否有效');
+                    console.error('4. 检查网络连接是否正常');
+                } else if (error.response.status === 400) {
+                    console.error('🔍 400错误诊断:');
+                    console.error('1. 检查Chat ID是否正确');
+                    console.error('2. 确认用户是否已与Bot开始对话');
+                    console.error('3. 验证消息格式是否正确');
+                } else if (error.response.status === 401) {
+                    console.error('🔍 401错误诊断:');
+                    console.error('1. Bot Token无效或已过期');
+                    console.error('2. 请重新从@BotFather获取Token');
+                }
+            } else if (error.code === 'ENOTFOUND') {
+                console.error('🔍 网络错误: 无法连接到Telegram服务器');
+                console.error('请检查网络连接');
+            } else if (error.code === 'ETIMEDOUT') {
+                console.error('🔍 超时错误: 请求超时');
+                console.error('请检查网络连接或稍后重试');
+            }
+            
             return false;
         }
     }
