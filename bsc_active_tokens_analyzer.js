@@ -4,6 +4,9 @@
  * 功能：获取候选代币的5分钟粒度147根K线，检测EMA21>EMA55>EMA144多头排列信号，发送Telegram通知
  */
 
+// 加载环境变量
+require('dotenv').config();
+
 const crypto = require('crypto');
 const axios = require('axios');
 const fs = require('fs');
@@ -15,6 +18,11 @@ class BSCActiveTokensAnalyzer {
         this.passphrase = passphrase;
         this.baseUrl = 'https://web3.okx.com';
         this.bscChainIndex = '56'; // BSC链的chainIndex
+        
+        // 初始化缓存
+        this.klineCache = new Map(); // 存储每个代币的144根K线数据
+        this.emaStatusCache = new Map(); // 存储每个代币的EMA状态历史
+        this.isInitialized = false; // 标记是否已完成初始化
         
         console.log('初始化BSC活跃代币分析器...');
     }
@@ -135,24 +143,37 @@ class BSCActiveTokensAnalyzer {
     }
 
     /**
-     * 获取K线数据（5分钟粒度）
+     * 获取K线数据（5分钟粒度）- 修改为只获取144根
      */
-    async getKlineData(tokenAddress, limit = 147) {
+    async getKlineData(tokenAddress, limit = 144) {
         try {
             const endpoint = '/api/v5/dex/market/historical-candles';
             
+            // 只请求144根K线数据
             const params = new URLSearchParams({
                 chainIndex: this.bscChainIndex,
                 tokenContractAddress: tokenAddress.toLowerCase(),
                 bar: '5m', // 5分钟粒度
-                limit: (limit + 5).toString() // 多获取几根K线，以防过滤后数量不足
+                limit: limit.toString()
             });
 
             const requestPath = `${endpoint}?${params.toString()}`;
             const headers = this.getHeaders('GET', requestPath);
             const fullUrl = this.baseUrl + requestPath;
 
-            const response = await axios.get(fullUrl, { headers, timeout: 10000 });
+            // 配置axios请求选项，包含代理和更详细的错误处理
+            const axiosConfig = {
+                headers,
+                timeout: 30000, // 增加超时时间到30秒
+                // 如果需要代理，可以在这里配置
+                // proxy: {
+                //     host: '127.0.0.1',
+                //     port: 7890
+                // }
+            };
+
+            console.log(`正在请求K线数据: ${fullUrl}`);
+            const response = await axios.get(fullUrl, axiosConfig);
             await this.sleep(200);
 
             if (response.data.code === '0' && response.data.data) {
@@ -168,10 +189,10 @@ class BSCActiveTokensAnalyzer {
                     volumeUsd: parseFloat(candle[6])
                 })).reverse(); // 按时间正序排列
                 
-                console.log(`${tokenAddress}: 获取到 ${candles.length} 根历史K线数据（均为已收盘）`);
+                console.log(`${tokenAddress}: 请求 ${limit} 根K线，实际获取到 ${candles.length} 根历史K线数据（均为已收盘）`);
                 
-                // 返回指定数量的K线
-                return candles.slice(-limit);
+                // 直接返回所有获取到的K线数据
+                return candles;
             }
             return [];
         } catch (error) {
@@ -180,6 +201,120 @@ class BSCActiveTokensAnalyzer {
         }
     }
 
+    /**
+     * 初始化所有代币的K线数据缓存
+     */
+    async initializeKlineCache() {
+        console.log('🔄 开始初始化K线数据缓存...');
+        const tokens = this.getTopVolumeBSCTokens();
+        
+        for (let i = 0; i < tokens.length; i++) {
+            const token = tokens[i];
+            console.log(`初始化 ${token.symbol} (${i + 1}/${tokens.length}) 的K线数据...`);
+            
+            const klineData = await this.getKlineData(token.address, 144);
+            if (klineData.length >= 144) {
+                // 存储144根K线数据到缓存
+                this.klineCache.set(token.address, klineData);
+                
+                // 计算并存储初始EMA状态
+                const emaStatus = this.calculateEMAStatus(klineData);
+                if (emaStatus) {
+                    const statusKey = `${token.address}_${emaStatus.timestamp}_prev`;
+                    this.emaStatusCache.set(statusKey, emaStatus.bullish);
+                    console.log(`${token.symbol} 初始EMA状态: ${emaStatus.bullish ? '多头排列' : '非多头排列'}`);
+                }
+            } else {
+                console.log(`${token.symbol} K线数据不足144根，跳过`);
+            }
+            
+            // 避免API频率限制
+            await this.sleep(300);
+        }
+        
+        this.isInitialized = true;
+        console.log('✅ K线数据缓存初始化完成');
+    }
+
+    /**
+     * 计算EMA状态（ema21 > ema55 > ema144）
+     */
+    calculateEMAStatus(klineData) {
+        if (klineData.length < 144) {
+            return null;
+        }
+        
+        // 提取收盘价
+        const closePrices = klineData.map(candle => candle.close);
+        
+        // 计算EMA
+        const ema21 = this.calculateEMA(closePrices, 21);
+        const ema55 = this.calculateEMA(closePrices, 55);
+        const ema144 = this.calculateEMA(closePrices, 144);
+        
+        // 获取最新K线的EMA值
+        const latestIndex = closePrices.length - 1;
+        const latestEMA21 = ema21[latestIndex];
+        const latestEMA55 = ema55[latestIndex];
+        const latestEMA144 = ema144[latestIndex];
+        
+        // 检查EMA值是否有效
+        if (latestEMA21 === null || latestEMA55 === null || latestEMA144 === null) {
+            return null;
+        }
+        
+        // 判断是否为多头排列
+        const bullish = latestEMA21 > latestEMA55 && latestEMA55 > latestEMA144;
+        
+        return {
+            bullish,
+            ema21: latestEMA21,
+            ema55: latestEMA55,
+            ema144: latestEMA144,
+            timestamp: klineData[latestIndex].timestamp,
+            price: closePrices[latestIndex]
+        };
+    }
+
+    /**
+     * 更新单个代币的K线数据缓存
+     */
+    async updateTokenKlineCache(tokenAddress) {
+        try {
+            // 获取最新的K线数据（只获取1根最新的）
+            const latestKline = await this.getKlineData(tokenAddress, 1);
+            if (latestKline.length === 0) {
+                console.log(`${tokenAddress} 无法获取最新K线数据`);
+                return null;
+            }
+            
+            const newCandle = latestKline[0];
+            const cachedKlines = this.klineCache.get(tokenAddress);
+            
+            if (!cachedKlines || cachedKlines.length === 0) {
+                console.log(`${tokenAddress} 缓存中无K线数据，跳过更新`);
+                return null;
+            }
+            
+            // 检查是否是新的K线（时间戳不同）
+            const lastCachedCandle = cachedKlines[cachedKlines.length - 1];
+            if (newCandle.timestamp <= lastCachedCandle.timestamp) {
+                console.log(`${tokenAddress} 没有新的K线数据`);
+                return null;
+            }
+            
+            // 添加新K线，删除最旧的K线，保持144根
+            const updatedKlines = [...cachedKlines.slice(1), newCandle];
+            this.klineCache.set(tokenAddress, updatedKlines);
+            
+            console.log(`${tokenAddress} K线缓存已更新，新K线时间: ${new Date(newCandle.timestamp).toISOString()}`);
+            
+            return updatedKlines;
+        } catch (error) {
+            console.error(`更新 ${tokenAddress} K线缓存失败:`, error.message);
+            return null;
+        }
+    }
     /**
      * 计算EMA（指数移动平均线）
      */
@@ -212,7 +347,6 @@ class BSCActiveTokensAnalyzer {
     }
 
     /**
-     * 获取成交量前100的BSC代币列表（从JSON文件提取的合约地址）
      */
     getTopVolumeBSCTokens() {
         // 从成交量前100的代币中提取的合约地址
@@ -237,7 +371,6 @@ class BSCActiveTokensAnalyzer {
   "0x932fb7f52adbc34ff81b4342b8c036b7b8ac4444",
   "0xfc5a743271672e91d77f0176e5cea581fbd5d834",
   "0xf486ad071f3bee968384d2e39e2d8af0fcf6fd46",
-  "0xaf44a1e76f56ee12adbb7ba8acd3cbd474888122",
   "0x3fefe29da25bea166fb5f6ade7b5976d2b0e586b",
   "0xe3225e11cab122f1a126a28997788e5230838ab9",
   "0x61fac5f038515572d6f42d4bcb6b581642753d50",
@@ -299,7 +432,6 @@ class BSCActiveTokensAnalyzer {
   "0x55ad16bd573b3365f43a9daeb0cc66a73821b4a5",
   "0x47474747477b199288bf72a1d702f7fe0fb1deea",
   "0x5845684b49aef79a5c0f887f50401c247dca7ac6",
-  "0x001208f7f53f78db2b32e1c68198d3e8f320aa23",
   "0xa2be3e48170a60119b5f0400c65f65f3158fbeee",
   "0x953783617a71a888f8b04f397f2c9e1a7c37af7e",
   "0x15247e6e23d3923a853ccf15940a20ccdf16e94a",
@@ -330,9 +462,103 @@ class BSCActiveTokensAnalyzer {
      * 使用OKX DEX API的代币交易信息接口
      */
     async getTokenInfo(tokenAddress, maxRetries = 3) {
+        // 首先尝试从代币列表API获取真实的代币名称和符号
+        const tokenListInfo = await this.getTokenFromList(tokenAddress, maxRetries);
+        
+        // 然后获取价格信息
+        const priceInfo = await this.getTokenPriceInfo(tokenAddress, maxRetries);
+        
+        // 合并信息
+        return {
+            name: tokenListInfo.name || `Token_${tokenAddress.slice(0, 8)}`,
+            symbol: tokenListInfo.symbol || `TOKEN_${tokenAddress.slice(-4).toUpperCase()}`,
+            marketCap: priceInfo.marketCap || '0',
+            volume24h: priceInfo.volume24h || '0',
+            holderCount: priceInfo.holderCount || '0',
+            price: priceInfo.price || '0'
+        };
+    }
+
+    /**
+     * 从OKX代币列表API获取代币的真实名称和符号
+     */
+    async getTokenFromList(tokenAddress, maxRetries = 3) {
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
             try {
-                console.log(`获取代币信息 ${tokenAddress} (尝试 ${attempt}/${maxRetries})...`);
+                console.log(`从代币列表获取信息 ${tokenAddress} (尝试 ${attempt}/${maxRetries})...`);
+                
+                const endpoint = '/api/v5/defi/explore/token/list';
+                const params = new URLSearchParams({
+                    tokenAddress: tokenAddress.toLowerCase(),
+                    chainId: '56' // BSC链ID
+                });
+                
+                const headers = this.getHeaders('GET', `${endpoint}?${params.toString()}`);
+                const fullUrl = `${this.baseUrl}${endpoint}?${params.toString()}`;
+
+                // 配置axios请求选项
+                const axiosConfig = {
+                    headers,
+                    timeout: 30000, // 增加超时时间
+                    // 如果需要代理，可以在这里配置
+                    // proxy: {
+                    //     host: '127.0.0.1',
+                    //     port: 7890
+                    // }
+                };
+
+                const response = await axios.get(fullUrl, axiosConfig);
+                await this.sleep(300);
+
+                console.log(`代币列表API响应状态: ${response.status}, 代码: ${response.data?.code}`);
+                
+                if (response.data.code === 0 && response.data.data && response.data.data.length > 0) {
+                    const tokenData = response.data.data[0];
+                    if (tokenData.tokenInfos && tokenData.tokenInfos.length > 0) {
+                        // 查找BSC网络的代币信息
+                        const bscToken = tokenData.tokenInfos.find(info => 
+                            info.network === 'BSC' && 
+                            info.tokenAddress.toLowerCase() === tokenAddress.toLowerCase()
+                        );
+                        
+                        if (bscToken) {
+                            console.log(`找到真实代币信息: ${bscToken.tokenSymbol}`);
+                            return {
+                                name: bscToken.tokenSymbol, // 使用符号作为名称
+                                symbol: bscToken.tokenSymbol
+                            };
+                        }
+                    }
+                }
+                
+                console.log(`代币列表API未找到 ${tokenAddress} 的信息`);
+                break; // 如果API调用成功但没找到数据，不需要重试
+                
+            } catch (error) {
+                console.error(`代币列表API调用失败 (${tokenAddress}) 尝试 ${attempt}/${maxRetries}:`, error.message);
+                
+                if (attempt === maxRetries) {
+                    console.log(`代币列表API所有重试都失败，使用默认命名`);
+                }
+                
+                await this.sleep(1000 * attempt);
+            }
+        }
+        
+        // 返回默认信息
+        return {
+            name: `Token_${tokenAddress.slice(0, 8)}`,
+            symbol: `TOKEN_${tokenAddress.slice(-4).toUpperCase()}`
+        };
+    }
+
+    /**
+     * 获取代币价格信息
+     */
+    async getTokenPriceInfo(tokenAddress, maxRetries = 3) {
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                console.log(`获取代币价格信息 ${tokenAddress} (尝试 ${attempt}/${maxRetries})...`);
                 
                 const endpoint = '/api/v5/dex/market/price-info';
                 
@@ -345,33 +571,36 @@ class BSCActiveTokensAnalyzer {
                 const headers = this.getHeaders('POST', endpoint, requestBody);
                 const fullUrl = this.baseUrl + endpoint;
 
-                const response = await axios.post(fullUrl, requestBody, { headers, timeout: 15000 });
-                await this.sleep(300); // 增加延迟时间
+                // 配置axios请求选项
+                const axiosConfig = {
+                    headers,
+                    timeout: 30000, // 增加超时时间
+                    // 如果需要代理，可以在这里配置
+                    // proxy: {
+                    //     host: '127.0.0.1',
+                    //     port: 7890
+                    // }
+                };
 
-                console.log(`API响应状态: ${response.status}, 代码: ${response.data?.code}`);
+                const response = await axios.post(fullUrl, requestBody, axiosConfig);
+                await this.sleep(300);
+
+                console.log(`价格API响应状态: ${response.status}, 代码: ${response.data?.code}`);
                 
                 if (response.data.code === '0') {
                     if (response.data.data && response.data.data.length > 0) {
                         const tokenData = response.data.data[0];
-                        console.log(`代币数据:`, JSON.stringify(tokenData, null, 2));
+                        console.log(`代币价格数据:`, JSON.stringify(tokenData, null, 2));
                         
-                        const result = {
-                            name: `Token_${tokenAddress.slice(0, 8)}`, // API不返回代币名称，使用地址前缀
-                            symbol: `TOKEN_${tokenAddress.slice(-4).toUpperCase()}`, // API不返回代币符号，使用地址后缀
+                        return {
                             marketCap: tokenData.marketCap || '0',
                             volume24h: tokenData.volume24H || '0',
                             holderCount: tokenData.holders || '0',
                             price: tokenData.price || '0'
                         };
-                        
-                        console.log(`解析后的代币信息:`, result);
-                        return result;
                     } else {
-                        console.log(`代币 ${tokenAddress} 未找到数据，可能是新代币或不支持的代币`);
-                        // 返回基本信息，避免显示Unknown
+                        console.log(`代币 ${tokenAddress} 未找到价格数据`);
                         return {
-                            name: `Token_${tokenAddress.slice(0, 8)}`,
-                            symbol: `TOKEN_${tokenAddress.slice(-4).toUpperCase()}`,
                             marketCap: '数据获取中',
                             volume24h: '数据获取中',
                             holderCount: '数据获取中',
@@ -379,30 +608,39 @@ class BSCActiveTokensAnalyzer {
                         };
                     }
                 } else {
-                    console.error(`API返回错误代码: ${response.data.code}, 消息: ${response.data.msg}`);
+                    console.error(`价格API返回错误代码: ${response.data.code}, 消息: ${response.data.msg}`);
                     if (attempt === maxRetries) {
-                        return this.getDefaultTokenInfo(tokenAddress);
+                        return {
+                            marketCap: '获取失败',
+                            volume24h: '获取失败',
+                            holderCount: '获取失败',
+                            price: '0'
+                        };
                     }
                 }
             } catch (error) {
-                console.error(`获取代币信息失败 (${tokenAddress}) 尝试 ${attempt}/${maxRetries}:`, error.message);
-                
-                if (error.response) {
-                    console.error(`HTTP状态: ${error.response.status}`);
-                    console.error(`响应数据:`, error.response.data);
-                }
+                console.error(`获取代币价格信息失败 (${tokenAddress}) 尝试 ${attempt}/${maxRetries}:`, error.message);
                 
                 if (attempt === maxRetries) {
-                    console.error(`所有重试都失败，返回默认信息`);
-                    return this.getDefaultTokenInfo(tokenAddress);
+                    console.error(`价格API所有重试都失败，返回默认信息`);
+                    return {
+                        marketCap: '获取失败',
+                        volume24h: '获取失败',
+                        holderCount: '获取失败',
+                        price: '0'
+                    };
                 }
                 
-                // 重试前等待更长时间
                 await this.sleep(1000 * attempt);
             }
         }
         
-        return this.getDefaultTokenInfo(tokenAddress);
+        return {
+            marketCap: '获取失败',
+            volume24h: '获取失败',
+            holderCount: '获取失败',
+            price: '0'
+        };
     }
     
     /**
@@ -422,97 +660,148 @@ class BSCActiveTokensAnalyzer {
     /**
      * 检测EMA多头排列信号
      */
-    async checkEMASignal(token) {
-        console.log(`检测 ${token.symbol} 的EMA信号...`);
-        
-        const klineData = await this.getKlineData(token.address, 147);
-        
-        if (klineData.length < 144) {
-            console.log(`${token.symbol} K线数据不足，跳过`);
+    /**
+     * 检测多头信号（新的EMA判断逻辑）
+     */
+    async checkBullishSignal(tokenAddress, tokenSymbol) {
+        try {
+            // 获取缓存的K线数据
+            const cachedKlines = this.klineCache.get(tokenAddress);
+            if (!cachedKlines || cachedKlines.length < 144) {
+                console.log(`${tokenSymbol} 缓存中K线数据不足，跳过检测`);
+                return null;
+            }
+            
+            // 计算当前K线的EMA状态
+            const currentEMAStatus = this.calculateEMAStatus(cachedKlines);
+            if (!currentEMAStatus) {
+                console.log(`${tokenSymbol} 无法计算EMA状态`);
+                return null;
+            }
+            
+            // 获取上一根K线的EMA状态
+            const prevTimestamp = cachedKlines[cachedKlines.length - 2].timestamp;
+            const prevStatusKey = `${tokenAddress}_${prevTimestamp}_prev`;
+            const prevBullishStatus = this.emaStatusCache.get(prevStatusKey);
+            
+            console.log(`${tokenSymbol} EMA状态检查:`);
+            console.log(`  当前EMA21: ${currentEMAStatus.ema21.toFixed(8)}`);
+            console.log(`  当前EMA55: ${currentEMAStatus.ema55.toFixed(8)}`);
+            console.log(`  当前EMA144: ${currentEMAStatus.ema144.toFixed(8)}`);
+            console.log(`  当前多头排列: ${currentEMAStatus.bullish}`);
+            console.log(`  上一根多头排列: ${prevBullishStatus}`);
+            
+            // 存储当前K线的EMA状态
+            const currentStatusKey = `${tokenAddress}_${currentEMAStatus.timestamp}_prev`;
+            this.emaStatusCache.set(currentStatusKey, currentEMAStatus.bullish);
+            
+            // 检查多头信号：上一根为false，当前为true
+            if (prevBullishStatus === false && currentEMAStatus.bullish === true) {
+                console.log(`🚀 ${tokenSymbol} 检测到多头信号！`);
+                
+                // 获取代币详细信息
+                const tokenInfo = await this.getTokenInfo(tokenAddress);
+                
+                return {
+                    symbol: tokenSymbol,
+                    address: tokenAddress,
+                    tokenInfo: tokenInfo,
+                    currentPrice: currentEMAStatus.price,
+                    ema21: currentEMAStatus.ema21,
+                    ema55: currentEMAStatus.ema55,
+                    ema144: currentEMAStatus.ema144,
+                    signalReason: '多头排列信号：上一根K线非多头排列，当前K线形成多头排列',
+                    timestamp: new Date().toISOString(),
+                    klineTimestamp: currentEMAStatus.timestamp
+                };
+            }
+            
+            // 清理旧的EMA状态缓存（保留最近10个状态）
+            this.cleanupEMAStatusCache(tokenAddress);
+            
+            return null;
+        } catch (error) {
+            console.error(`检测 ${tokenSymbol} 多头信号失败:`, error.message);
             return null;
         }
-        
-        // 提取收盘价
-        const closePrices = klineData.map(candle => candle.close);
-        
-        // 计算EMA
-        const ema21 = this.calculateEMA(closePrices, 21);
-        const ema55 = this.calculateEMA(closePrices, 55);
-        const ema144 = this.calculateEMA(closePrices, 144);
-        
-        // 获取最新和前一根K线的EMA值
-        const latestIndex = closePrices.length - 1;
-        const prevIndex = latestIndex - 1;
-        
-        // 检查EMA值是否有效（不为null）
-        if (ema21[latestIndex] === null || ema21[prevIndex] === null ||
-            ema55[latestIndex] === null || ema55[prevIndex] === null ||
-            ema144[latestIndex] === null || ema144[prevIndex] === null) {
-            console.log(`${token.symbol} EMA数据不足，跳过`);
-            return null;
-        }
-        
-        const latestEMA21 = ema21[latestIndex];
-        const latestEMA55 = ema55[latestIndex];
-        const latestEMA144 = ema144[latestIndex];
-        
-        const prevEMA21 = ema21[prevIndex];
-        const prevEMA55 = ema55[prevIndex];
-        const prevEMA144 = ema144[prevIndex];
-        
-        // 打印当前K线EMA值
-        console.log(`${token.symbol} 当前K线EMA值 - EMA21: ${latestEMA21.toFixed(8)}, EMA55: ${latestEMA55.toFixed(8)}, EMA144: ${latestEMA144.toFixed(8)}`);
-        
-        // 打印前一根K线EMA值
-        console.log(`${token.symbol} 前一根K线EMA值 - EMA21: ${prevEMA21.toFixed(8)}, EMA55: ${prevEMA55.toFixed(8)}, EMA144: ${prevEMA144.toFixed(8)}`);
-        
-        // 检查最新K线是否满足多头排列：EMA21 > EMA55 > EMA144
-        const currentBullish = latestEMA21 > latestEMA55 && latestEMA55 > latestEMA144;
-        
-        // 检查前一根K线是否不满足多头排列
-        const prevBullish = prevEMA21 > prevEMA55 && prevEMA55 > prevEMA144;
-        const prevNotBullish = !prevBullish;
-        
-        console.log(`${token.symbol} - 当前K线多头排列: ${currentBullish}`);
-        console.log(`${token.symbol} - 前一根K线多头排列: ${prevBullish}`);
-        console.log(`${token.symbol} - 前一根K线非多头排列: ${prevNotBullish}`);
-        
-        // 详细的EMA比较结果
-        console.log(`${token.symbol} - 当前K线EMA比较:`);
-        console.log(`  EMA21(${latestEMA21.toFixed(8)}) > EMA55(${latestEMA55.toFixed(8)}) = ${latestEMA21 > latestEMA55}`);
-        console.log(`  EMA55(${latestEMA55.toFixed(8)}) > EMA144(${latestEMA144.toFixed(8)}) = ${latestEMA55 > latestEMA144}`);
-        
-        console.log(`${token.symbol} - 前一根K线EMA比较:`);
-        console.log(`  EMA21(${prevEMA21.toFixed(8)}) > EMA55(${prevEMA55.toFixed(8)}) = ${prevEMA21 > prevEMA55}`);
-        console.log(`  EMA55(${prevEMA55.toFixed(8)}) > EMA144(${prevEMA144.toFixed(8)}) = ${prevEMA55 > prevEMA144}`);
-        
-        // 如果当前满足多头排列且前一根不满足，则触发信号
-        if (currentBullish && prevNotBullish) {
-            console.log(`🚀 ${token.symbol} 触发EMA多头排列信号！`);
-            
-            // 获取代币详细信息
-            const tokenInfo = await this.getTokenInfo(token.address);
-            
-            return {
-                symbol: token.symbol,
-                address: token.address,
-                tokenInfo: tokenInfo,
-                latestPrice: closePrices[latestIndex],
-                ema21: latestEMA21,
-                ema55: latestEMA55,
-                ema144: latestEMA144,
-                timestamp: new Date().toISOString()
-            };
-        }
-        
-        return null;
     }
 
-
+    /**
+     * 清理EMA状态缓存
+     */
+    cleanupEMAStatusCache(tokenAddress) {
+        const keys = Array.from(this.emaStatusCache.keys())
+            .filter(key => key.startsWith(tokenAddress))
+            .sort((a, b) => {
+                const timestampA = parseInt(a.split('_')[1]);
+                const timestampB = parseInt(b.split('_')[1]);
+                return timestampB - timestampA; // 降序排列
+            });
+        
+        // 只保留最近10个状态
+        if (keys.length > 10) {
+            const keysToDelete = keys.slice(10);
+            keysToDelete.forEach(key => this.emaStatusCache.delete(key));
+        }
+    }
 
     /**
-     * 运行EMA多头排列监控
+     * 定时任务：每5分钟第10秒执行
      */
+    startScheduledTask() {
+        console.log('🕐 启动定时任务：每5分钟第10秒检测多头信号');
+        
+        setInterval(async () => {
+            const now = new Date();
+            const minutes = now.getMinutes();
+            const seconds = now.getSeconds();
+            
+            // 每5分钟的第10秒执行（0:10, 5:10, 10:10, 15:10, 20:10, 25:10, 30:10, 35:10, 40:10, 45:10, 50:10, 55:10）
+            if (minutes % 5 === 0 && seconds === 10) {
+                console.log(`\n⏰ ${now.toISOString()} - 开始执行定时检测任务`);
+                await this.runScheduledAnalysis();
+            }
+        }, 1000); // 每秒检查一次
+    }
+
+    /**
+     * 执行定时分析任务
+     */
+    async runScheduledAnalysis() {
+        if (!this.isInitialized) {
+            console.log('❌ 系统未初始化，跳过定时任务');
+            return;
+        }
+        
+        const tokens = this.getTopVolumeBSCTokens();
+        console.log(`🔍 开始检测 ${tokens.length} 个代币的多头信号...`);
+        
+        for (let i = 0; i < tokens.length; i++) {
+            const token = tokens[i];
+            
+            try {
+                // 更新K线缓存
+                const updatedKlines = await this.updateTokenKlineCache(token.address);
+                if (updatedKlines) {
+                    // 检测多头信号
+                    const signal = await this.checkBullishSignal(token.address, token.symbol);
+                    if (signal) {
+                        // 发送Telegram消息
+                        const message = this.formatTelegramMessage(signal);
+                        await this.sendTelegramMessage(message);
+                    }
+                }
+                
+                // 避免API频率限制
+                await this.sleep(200);
+            } catch (error) {
+                console.error(`处理代币 ${token.symbol} 时出错:`, error.message);
+            }
+        }
+        
+        console.log('✅ 定时检测任务完成\n');
+    }
+
     async runAnalysis() {
         try {
             console.log('=== BSC链EMA多头排列监控开始 ===');
@@ -551,7 +840,7 @@ class BSCActiveTokensAnalyzer {
                 console.log('发现的信号:');
                 signalTokens.forEach((signal, index) => {
                     console.log(`${index + 1}. ${signal.symbol} (${signal.address})`);
-                    console.log(`   当前价格: ${signal.latestPrice}`);
+                    console.log(`   当前价格: ${signal.currentPrice}`);
                     console.log(`   EMA21: ${signal.ema21.toFixed(8)}, EMA55: ${signal.ema55.toFixed(8)}, EMA144: ${signal.ema144.toFixed(8)}`);
                 });
             }
@@ -563,10 +852,148 @@ class BSCActiveTokensAnalyzer {
                 signalsFound: signalTokens.length,
                 signals: signalTokens
             };
-            
         } catch (error) {
             console.error('监控过程中发生错误:', error);
             throw error;
+        }
+    }
+
+    async checkEMASignal(token) {
+        try {
+            console.log(`检测 ${token.symbol} 的EMA信号...`);
+            
+            const klineData = await this.getKlineData(token.address, 147);
+            
+            if (klineData.length < 144) {
+                console.log(`${token.symbol} K线数据不足，跳过`);
+                return null;
+            }
+            
+            // 提取收盘价
+            const closePrices = klineData.map(candle => candle.close);
+            
+            // 计算EMA
+            const ema21 = this.calculateEMA(closePrices, 21);
+            const ema55 = this.calculateEMA(closePrices, 55);
+            const ema144 = this.calculateEMA(closePrices, 144);
+            
+            // 获取最新和前几根K线的EMA值用于趋势分析
+            const latestIndex = closePrices.length - 1;
+            const prevIndex = latestIndex - 1;
+            const prev2Index = latestIndex - 2;
+            const prev3Index = latestIndex - 3;
+            
+            // 检查EMA值是否有效（不为null）
+            if (ema21[latestIndex] === null || ema21[prev3Index] === null ||
+                ema55[latestIndex] === null || ema55[prev3Index] === null ||
+                ema144[latestIndex] === null || ema144[prev3Index] === null) {
+                console.log(`${token.symbol} EMA数据不足，跳过`);
+                return null;
+            }
+            
+            const latestEMA21 = ema21[latestIndex];
+            const latestEMA55 = ema55[latestIndex];
+            const latestEMA144 = ema144[latestIndex];
+            
+            const prevEMA21 = ema21[prevIndex];
+            const prevEMA55 = ema55[prevIndex];
+            const prevEMA144 = ema144[prevIndex];
+            
+            // 打印当前K线EMA值
+            console.log(`${token.symbol} 当前K线EMA值 - EMA21: ${latestEMA21.toFixed(8)}, EMA55: ${latestEMA55.toFixed(8)}, EMA144: ${latestEMA144.toFixed(8)}`);
+            
+            // 检查当前是否满足多头排列：EMA21 > EMA55 > EMA144
+            const currentBullish = latestEMA21 > latestEMA55 && latestEMA55 > latestEMA144;
+            
+            // 检查EMA趋势方向（是否向上）
+            const ema21Rising = latestEMA21 > ema21[prev2Index] && ema21[prev2Index] > ema21[prev3Index];
+            const ema55Rising = latestEMA55 > ema55[prev2Index];
+            const ema144Rising = latestEMA144 > ema144[prev3Index];
+            
+            // 检查价格相对于EMA的位置
+            const priceAboveEMA21 = closePrices[latestIndex] > latestEMA21;
+            const priceAboveEMA55 = closePrices[latestIndex] > latestEMA55;
+            
+            // 计算EMA之间的距离（用于判断排列的强度）
+            const ema21_55_gap = (latestEMA21 - latestEMA55) / latestEMA55;
+            const ema55_144_gap = (latestEMA55 - latestEMA144) / latestEMA144;
+            
+            // 检查最近几根K线的多头排列情况
+            const recentBullishCount = [latestIndex, prevIndex, prev2Index].filter(i => 
+                ema21[i] > ema55[i] && ema55[i] > ema144[i]
+            ).length;
+            
+            console.log(`${token.symbol} - 多头排列分析:`);
+            console.log(`  当前多头排列: ${currentBullish}`);
+            console.log(`  EMA21上升趋势: ${ema21Rising}`);
+            console.log(`  EMA55上升趋势: ${ema55Rising}`);
+            console.log(`  EMA144上升趋势: ${ema144Rising}`);
+            console.log(`  价格高于EMA21: ${priceAboveEMA21}`);
+            console.log(`  价格高于EMA55: ${priceAboveEMA55}`);
+            console.log(`  EMA21-55间距: ${(ema21_55_gap * 100).toFixed(3)}%`);
+            console.log(`  EMA55-144间距: ${(ema55_144_gap * 100).toFixed(3)}%`);
+            console.log(`  最近3根K线多头排列数量: ${recentBullishCount}`);
+            
+            // 优化的信号触发条件
+            let signalTriggered = false;
+            let signalReason = '';
+            
+            // 条件1: 刚形成多头排列且趋势向上
+            if (currentBullish && ema21Rising && ema55Rising && 
+                recentBullishCount >= 1 && recentBullishCount <= 2) {
+                signalTriggered = true;
+                signalReason = '刚形成多头排列且趋势向上';
+            }
+            
+            // 条件2: 多头排列稳定且价格突破EMA21
+            else if (currentBullish && recentBullishCount >= 2 && 
+                     priceAboveEMA21 && priceAboveEMA55 &&
+                     ema21_55_gap > 0.001 && ema55_144_gap > 0.001) {
+                signalTriggered = true;
+                signalReason = '多头排列稳定且价格强势突破';
+            }
+            
+            // 条件3: EMA21向上穿越EMA55（金叉）
+            else if (latestEMA21 > latestEMA55 && prevEMA21 <= prevEMA55 && 
+                     ema21Rising && priceAboveEMA21) {
+                signalTriggered = true;
+                signalReason = 'EMA21向上穿越EMA55(金叉)';
+            }
+            
+            if (signalTriggered) {
+                console.log(`🚀 ${token.symbol} 触发EMA信号！原因: ${signalReason}`);
+                
+                // 获取代币详细信息
+                const tokenInfo = await this.getTokenInfo(token.address);
+                
+                return {
+                    symbol: token.symbol,
+                    address: token.address,
+                    tokenInfo: tokenInfo,
+                    currentPrice: closePrices[latestIndex],
+                    ema21: latestEMA21,
+                    ema55: latestEMA55,
+                    ema144: latestEMA144,
+                    signalReason: signalReason,
+                    trendStrength: {
+                        ema21Rising,
+                        ema55Rising,
+                        ema144Rising,
+                        priceAboveEMA21,
+                        priceAboveEMA55,
+                        ema21_55_gap: ema21_55_gap * 100,
+                        ema55_144_gap: ema55_144_gap * 100,
+                        recentBullishCount
+                    },
+                    timestamp: new Date().toISOString(),
+                    klineTimestamp: klineData[latestIndex].timestamp
+                };
+            }
+            
+            return null;
+        } catch (error) {
+            console.error(`检测 ${token.symbol} 时出错:`, error.message);
+            return null;
         }
     }
     
@@ -575,26 +1002,28 @@ class BSCActiveTokensAnalyzer {
      */
     formatTelegramMessage(signal) {
         const tokenInfo = signal.tokenInfo;
-        
+
         let message = `🚀 <b>EMA多头排列信号</b>\n\n`;
         message += `📊 <b>代币信息:</b>\n`;
         message += `• 名称: ${tokenInfo?.name || 'Unknown'}\n`;
-        message += `• 符号: ${signal.symbol}\n`;
+        message += `• 符号: ${tokenInfo?.symbol || signal.symbol}\n`;
         message += `• 合约地址: <code>${signal.address}</code>\n\n`;
-        
+
         message += `💰 <b>市场数据:</b>\n`;
         message += `• 市值: $${this.formatNumber(tokenInfo?.marketCap || '0')}\n`;
         message += `• 24h成交量: $${this.formatNumber(tokenInfo?.volume24h || '0')}\n`;
         message += `• 持币地址数: ${this.formatNumber(tokenInfo?.holderCount || '0')}\n\n`;
-        
+
         message += `📈 <b>EMA指标:</b>\n`;
         message += `• EMA21: ${signal.ema21.toFixed(8)}\n`;
         message += `• EMA55: ${signal.ema55.toFixed(8)}\n`;
         message += `• EMA144: ${signal.ema144.toFixed(8)}\n`;
-        message += `• 当前价格: ${signal.latestPrice.toFixed(8)}\n\n`;
-        
-        message += `⏰ 时间: ${signal.timestamp}`;
-        
+        message += `• 当前价格: ${signal.currentPrice.toFixed(8)}\n\n`;
+
+        message += `🎯 <b>信号原因:</b> ${signal.signalReason}\n\n`;
+        message += `⏰ <b>检测时间:</b> ${signal.timestamp}\n`;
+        message += `📅 <b>K线时间:</b> ${new Date(signal.klineTimestamp).toISOString()}`;
+
         return message;
     }
     
@@ -641,7 +1070,6 @@ function checkConfig() {
 // 主函数
 async function main() {
     try {
-        // 检查配置
         checkConfig();
         
         const analyzer = new BSCActiveTokensAnalyzer(
@@ -650,24 +1078,37 @@ async function main() {
             CONFIG.OKX_API_PASSPHRASE
         );
         
-        console.log('=== 启动EMA多头排列监控服务 ===');
-        console.log('每5分钟检测一次，按Ctrl+C停止服务');
+        console.log('🚀 启动BSC活跃代币EMA分析器...');
         
-        // 立即执行一次
-        await analyzer.runAnalysis();
+        // 初始化K线缓存
+        console.log('📊 初始化K线数据缓存...');
+        await analyzer.initializeKlineCache();
         
-        // 每5分钟执行一次
-        setInterval(async () => {
-            try {
-                console.log('\n=== 开始新一轮检测 ===');
-                await analyzer.runAnalysis();
-            } catch (error) {
-                console.error('检测过程中出错:', error.message);
+        // 标记为已初始化
+        analyzer.isInitialized = true;
+        console.log('✅ 系统初始化完成');
+        
+        // 启动定时任务
+        analyzer.startScheduledTask();
+        
+        // 保持程序运行
+        console.log('🔄 程序正在运行中，按 Ctrl+C 退出...');
+        process.on('SIGINT', () => {
+            console.log('\n👋 程序正在退出...');
+            process.exit(0);
+        });
+        
+        // 防止程序退出
+        setInterval(() => {
+            // 每小时输出一次状态
+            const now = new Date();
+            if (now.getMinutes() === 0 && now.getSeconds() === 0) {
+                console.log(`💡 系统运行状态正常 - ${now.toISOString()}`);
             }
-        }, 5 * 60 * 1000); // 5分钟 = 5 * 60 * 1000 毫秒
+        }, 1000);
         
     } catch (error) {
-        console.error('程序执行失败:', error.message);
+        console.error('程序启动失败:', error);
         process.exit(1);
     }
 }
