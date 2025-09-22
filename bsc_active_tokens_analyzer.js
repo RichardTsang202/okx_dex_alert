@@ -188,8 +188,13 @@ class BSCActiveTokensAnalyzer {
             return [];
         }
 
-        const ema = [];
+        const ema = new Array(prices.length);
         const multiplier = 2 / (period + 1);
+        
+        // 前面的值设为null，表示无效
+        for (let i = 0; i < period - 1; i++) {
+            ema[i] = null;
+        }
         
         // 第一个EMA值使用SMA
         let sma = 0;
@@ -295,7 +300,6 @@ class BSCActiveTokensAnalyzer {
   "0x47474747477b199288bf72a1d702f7fe0fb1deea",
   "0x5845684b49aef79a5c0f887f50401c247dca7ac6",
   "0x001208f7f53f78db2b32e1c68198d3e8f320aa23",
-  "0x17eafd08994305d8ace37efb82f1523177ec70ee",
   "0xa2be3e48170a60119b5f0400c65f65f3158fbeee",
   "0x953783617a71a888f8b04f397f2c9e1a7c37af7e",
   "0x15247e6e23d3923a853ccf15940a20ccdf16e94a",
@@ -439,6 +443,14 @@ class BSCActiveTokensAnalyzer {
         // 获取最新和前一根K线的EMA值
         const latestIndex = closePrices.length - 1;
         const prevIndex = latestIndex - 1;
+        
+        // 检查EMA值是否有效（不为null）
+        if (ema21[latestIndex] === null || ema21[prevIndex] === null ||
+            ema55[latestIndex] === null || ema55[prevIndex] === null ||
+            ema144[latestIndex] === null || ema144[prevIndex] === null) {
+            console.log(`${token.symbol} EMA数据不足，跳过`);
+            return null;
+        }
         
         const latestEMA21 = ema21[latestIndex];
         const latestEMA55 = ema55[latestIndex];
