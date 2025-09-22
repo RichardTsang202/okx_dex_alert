@@ -139,13 +139,13 @@ class BSCActiveTokensAnalyzer {
      */
     async getKlineData(tokenAddress, limit = 147) {
         try {
-            const endpoint = '/api/v5/dex/market/candles';
+            const endpoint = '/api/v5/dex/market/historical-candles';
             
             const params = new URLSearchParams({
                 chainIndex: this.bscChainIndex,
                 tokenContractAddress: tokenAddress.toLowerCase(),
                 bar: '5m', // 5分钟粒度
-                limit: limit.toString()
+                limit: (limit + 5).toString() // 多获取几根K线，以防过滤后数量不足
             });
 
             const requestPath = `${endpoint}?${params.toString()}`;
@@ -156,18 +156,22 @@ class BSCActiveTokensAnalyzer {
             await this.sleep(200);
 
             if (response.data.code === '0' && response.data.data) {
-                // 返回格式：[ts, o, h, l, c, vol, volUsd, confirm]
-                // 我们需要收盘价（索引4）
-                return response.data.data.map(candle => ({
+                // 历史K线API返回格式：[ts, o, h, l, c, vol, volUsd]
+                // 历史K线API只返回已收盘的K线数据，不包含confirm字段
+                const candles = response.data.data.map(candle => ({
                     timestamp: parseInt(candle[0]),
                     open: parseFloat(candle[1]),
                     high: parseFloat(candle[2]),
                     low: parseFloat(candle[3]),
                     close: parseFloat(candle[4]),
                     volume: parseFloat(candle[5]),
-                    volumeUsd: parseFloat(candle[6]),
-                    confirm: candle[7]
+                    volumeUsd: parseFloat(candle[6])
                 })).reverse(); // 按时间正序排列
+                
+                console.log(`${tokenAddress}: 获取到 ${candles.length} 根历史K线数据（均为已收盘）`);
+                
+                // 返回指定数量的K线
+                return candles.slice(-limit);
             }
             return [];
         } catch (error) {
@@ -318,39 +322,96 @@ class BSCActiveTokensAnalyzer {
     }
 
     /**
-     * 获取代币详细信息
+     * 获取代币详细信息（带重试机制）
      */
-    async getTokenInfo(tokenAddress) {
-        try {
-            const endpoint = '/api/v5/dex/market/token';
-            
-            const params = new URLSearchParams({
-                chainIndex: this.bscChainIndex,
-                tokenContractAddress: tokenAddress.toLowerCase()
-            });
+    async getTokenInfo(tokenAddress, maxRetries = 3) {
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                console.log(`获取代币信息 ${tokenAddress} (尝试 ${attempt}/${maxRetries})...`);
+                
+                const endpoint = '/api/v5/dex/market/token';
+                
+                const params = new URLSearchParams({
+                    chainIndex: this.bscChainIndex,
+                    tokenContractAddress: tokenAddress.toLowerCase()
+                });
 
-            const requestPath = `${endpoint}?${params.toString()}`;
-            const headers = this.getHeaders('GET', requestPath);
-            const fullUrl = this.baseUrl + requestPath;
+                const requestPath = `${endpoint}?${params.toString()}`;
+                const headers = this.getHeaders('GET', requestPath);
+                const fullUrl = this.baseUrl + requestPath;
 
-            const response = await axios.get(fullUrl, { headers, timeout: 10000 });
-            await this.sleep(200);
+                const response = await axios.get(fullUrl, { headers, timeout: 15000 });
+                await this.sleep(300); // 增加延迟时间
 
-            if (response.data.code === '0' && response.data.data && response.data.data.length > 0) {
-                const tokenData = response.data.data[0];
-                return {
-                    name: tokenData.tokenName || 'Unknown',
-                    symbol: tokenData.tokenSymbol || 'Unknown',
-                    marketCap: tokenData.marketCap || '0',
-                    volume24h: tokenData.volume24h || '0',
-                    holderCount: tokenData.holderCount || '0'
-                };
+                console.log(`API响应状态: ${response.status}, 代码: ${response.data?.code}`);
+                
+                if (response.data.code === '0') {
+                    if (response.data.data && response.data.data.length > 0) {
+                        const tokenData = response.data.data[0];
+                        console.log(`代币数据:`, JSON.stringify(tokenData, null, 2));
+                        
+                        const result = {
+                            name: tokenData.tokenName || tokenData.name || 'Unknown',
+                            symbol: tokenData.tokenSymbol || tokenData.symbol || 'Unknown',
+                            marketCap: tokenData.marketCap || tokenData.marketCapUsd || '0',
+                            volume24h: tokenData.volume24h || tokenData.volume24hUsd || '0',
+                            holderCount: tokenData.holderCount || tokenData.holders || '0',
+                            price: tokenData.price || tokenData.priceUsd || '0'
+                        };
+                        
+                        console.log(`解析后的代币信息:`, result);
+                        return result;
+                    } else {
+                        console.log(`代币 ${tokenAddress} 未找到数据，可能是新代币或不支持的代币`);
+                        // 返回基本信息，避免显示Unknown
+                        return {
+                            name: `Token_${tokenAddress.slice(0, 8)}`,
+                            symbol: `TOKEN_${tokenAddress.slice(-4).toUpperCase()}`,
+                            marketCap: '数据获取中',
+                            volume24h: '数据获取中',
+                            holderCount: '数据获取中',
+                            price: '0'
+                        };
+                    }
+                } else {
+                    console.error(`API返回错误代码: ${response.data.code}, 消息: ${response.data.msg}`);
+                    if (attempt === maxRetries) {
+                        return this.getDefaultTokenInfo(tokenAddress);
+                    }
+                }
+            } catch (error) {
+                console.error(`获取代币信息失败 (${tokenAddress}) 尝试 ${attempt}/${maxRetries}:`, error.message);
+                
+                if (error.response) {
+                    console.error(`HTTP状态: ${error.response.status}`);
+                    console.error(`响应数据:`, error.response.data);
+                }
+                
+                if (attempt === maxRetries) {
+                    console.error(`所有重试都失败，返回默认信息`);
+                    return this.getDefaultTokenInfo(tokenAddress);
+                }
+                
+                // 重试前等待更长时间
+                await this.sleep(1000 * attempt);
             }
-            return null;
-        } catch (error) {
-            console.error(`获取代币信息失败 (${tokenAddress}):`, error.message);
-            return null;
         }
+        
+        return this.getDefaultTokenInfo(tokenAddress);
+    }
+    
+    /**
+     * 获取默认代币信息
+     */
+    getDefaultTokenInfo(tokenAddress) {
+        return {
+            name: `Token_${tokenAddress.slice(0, 8)}`,
+            symbol: `TOKEN_${tokenAddress.slice(-4).toUpperCase()}`,
+            marketCap: '数据获取失败',
+            volume24h: '数据获取失败',
+            holderCount: '数据获取失败',
+            price: '0'
+        };
     }
 
     /**
