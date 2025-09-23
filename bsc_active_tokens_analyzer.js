@@ -1,7 +1,7 @@
 /**
  * BSC链代币EMA多头排列监控器
  * 基于OKX DEX API文档实现
- * 功能：获取候选代币的5分钟粒度147根K线，检测EMA21>EMA55>EMA144多头排列信号，发送Telegram通知
+ * 功能：获取候选代币的15分钟粒度147根K线，检测EMA21>EMA55>EMA144多头排列信号，发送Telegram通知
  */
 
 // 加载环境变量
@@ -143,7 +143,7 @@ class BSCActiveTokensAnalyzer {
     }
 
     /**
-     * 获取K线数据（5分钟粒度）- 修改为只获取144根
+     * 获取K线数据（15分钟粒度）- 修改为只获取144根
      */
     async getKlineData(tokenAddress, limit = 144) {
         try {
@@ -153,7 +153,7 @@ class BSCActiveTokensAnalyzer {
             const params = new URLSearchParams({
                 chainIndex: this.bscChainIndex,
                 tokenContractAddress: tokenAddress.toLowerCase(),
-                bar: '5m', // 5分钟粒度
+                bar: '15m', // 15分钟粒度
                 limit: limit.toString()
             });
 
@@ -746,17 +746,17 @@ class BSCActiveTokensAnalyzer {
     }
 
     /**
-     * 定时任务：每5分钟第10秒执行
+     * 定时任务：每15分钟第10秒执行
      */
     startScheduledTask() {
-        console.log('🕐 启动定时任务：每5分钟第10秒检测多头信号');
+        console.log('🕐 启动定时任务：每15分钟第10秒检测多头信号');
         
         setInterval(async () => {
             const now = new Date();
             const minutes = now.getMinutes();
             const seconds = now.getSeconds();
             
-            // 每5分钟的第10秒执行（0:10, 5:10, 10:10, 15:10, 20:10, 25:10, 30:10, 35:10, 40:10, 45:10, 50:10, 55:10）
+            // 每15分钟的第10秒执行（0:10, 5:10, 10:10, 15:10, 20:10, 25:10, 30:10, 35:10, 40:10, 45:10, 50:10, 55:10）
             if (minutes % 5 === 0 && seconds === 10) {
                 console.log(`\n⏰ ${now.toISOString()} - 开始执行定时检测任务`);
                 await this.runScheduledAnalysis();
